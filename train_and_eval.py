@@ -1,7 +1,10 @@
+import os
 import pandas as pd
 import numpy as np
 import re
 import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from datasets import Dataset
 from transformers import (
@@ -11,17 +14,27 @@ from transformers import (
     TrainingArguments
 )
 
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    accuracy_score,
+    f1_score
+)
 
+# =========================
+# 0. SETUP
+# =========================
+os.makedirs("results", exist_ok=True)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Using device:", device)
 
-#load dataset
+# =========================
+# 1. LOAD DATASET
+# =========================
 df = pd.read_csv("data.csv", encoding="latin-1", engine="python")
 
 df = df[["Tweet", "HS"]]
-df = df.rename(columns={
-    "Tweet": "text",
-    "HS": "labels"
-})
+df = df.rename(columns={"Tweet": "text", "HS": "labels"})
 
 def clean_text(t):
     t = t.lower()
@@ -33,30 +46,57 @@ def clean_text(t):
 
 df["text"] = df["text"].astype(str).apply(clean_text)
 
-#split dataset
+print("Total samples:", len(df))
 
+# =========================
+# 2. VISUALISASI LABEL DISTRIBUTION
+# =========================
+plt.figure(figsize=(6,4))
+sns.countplot(x=df["labels"])
+plt.title("Label Distribution (HS vs Non-HS)")
+plt.xlabel("Label (0=Non-HS, 1=HS)")
+plt.ylabel("Count")
+plt.tight_layout()
+plt.savefig("results/label_distribution.png", dpi=300)
+plt.show()
+
+# =========================
+# 3. SPLIT DATASET
+# =========================
 dataset = Dataset.from_pandas(df)
-
-dataset = dataset.train_test_split(
-    test_size=0.2,
-    seed=42
-)
+dataset = dataset.train_test_split(test_size=0.2, seed=42)
 
 train_ds = dataset["train"]
 eval_ds = dataset["test"]
 
-#load indo bert
+# =========================
+# 4. VISUALISASI PANJANG TEKS
+# =========================
+df["text_length"] = df["text"].apply(lambda x: len(x.split()))
 
+plt.figure(figsize=(7,5))
+plt.hist(df["text_length"], bins=50)
+plt.title("Text Length Distribution")
+plt.xlabel("Number of Tokens")
+plt.ylabel("Frequency")
+plt.tight_layout()
+plt.savefig("results/text_length_distribution.png", dpi=300)
+plt.show()
+
+# =========================
+# 5. LOAD INDO-BERT
+# =========================
 MODEL = "indobenchmark/indobert-base-p1"
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL)
 model = AutoModelForSequenceClassification.from_pretrained(
     MODEL,
     num_labels=2
-)
+).to(device)
 
-#tokonize dataset
-
+# =========================
+# 6. TOKENIZATION
+# =========================
 def tokenize(batch):
     return tokenizer(
         batch["text"],
@@ -71,9 +111,9 @@ eval_ds = eval_ds.map(tokenize, batched=True)
 train_ds.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
 eval_ds.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
 
-
-#metrics
-
+# =========================
+# 7. METRICS
+# =========================
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=1)
@@ -83,14 +123,12 @@ def compute_metrics(eval_pred):
         "f1": f1_score(labels, preds)
     }
 
-
-#training arguments
-
-
+# =========================
+# 8. TRAINING ARGUMENTS
+# =========================
 training_args = TrainingArguments(
     output_dir="./results",
     eval_strategy="epoch",
-    #evaluation_strategy="epoch",
     save_strategy="epoch",
     learning_rate=2e-5,
     per_device_train_batch_size=16,
@@ -104,9 +142,9 @@ training_args = TrainingArguments(
     report_to="none"
 )
 
-
-#trainer
-
+# =========================
+# 9. TRAINER
+# =========================
 trainer = Trainer(
     model=model,
     args=training_args,
@@ -116,17 +154,80 @@ trainer = Trainer(
     compute_metrics=compute_metrics
 )
 
-
-#training 
+# =========================
+# 10. TRAINING
+# =========================
 trainer.train()
 
+# =========================
+# 11. VISUALISASI LOSS
+# =========================
+log_history = trainer.state.log_history
 
-#evaluation
+train_loss = []
+eval_loss = []
+epochs = []
 
+for log in log_history:
+    if "loss" in log and "epoch" in log:
+        train_loss.append(log["loss"])
+        epochs.append(log["epoch"])
+    if "eval_loss" in log:
+        eval_loss.append(log["eval_loss"])
+
+plt.figure(figsize=(7,5))
+plt.plot(epochs[:len(train_loss)], train_loss, label="Training Loss")
+plt.plot(range(1, len(eval_loss)+1), eval_loss, label="Validation Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Training vs Validation Loss")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("results/loss_curve.png", dpi=300)
+plt.show()
+
+# =========================
+# 12. EVALUATION
+# =========================
 preds = trainer.predict(eval_ds)
 
 y_true = preds.label_ids
 y_pred = np.argmax(preds.predictions, axis=1)
 
 print(classification_report(y_true, y_pred, target_names=["Non-HS", "HS"]))
-print(confusion_matrix(y_true, y_pred))
+
+# =========================
+# 13. CONFUSION MATRIX
+# =========================
+cm = confusion_matrix(y_true, y_pred)
+
+plt.figure(figsize=(6,5))
+sns.heatmap(
+    cm,
+    annot=True,
+    fmt="d",
+    cmap="Blues",
+    xticklabels=["Non-HS", "HS"],
+    yticklabels=["Non-HS", "HS"]
+)
+plt.xlabel("Predicted Label")
+plt.ylabel("True Label")
+plt.title("Confusion Matrix – IndoBERT Hate Speech")
+plt.tight_layout()
+plt.savefig("results/confusion_matrix.png", dpi=300)
+plt.show()
+
+# =========================
+# 14. ERROR ANALYSIS SAMPLE
+# =========================
+eval_df = eval_ds.to_pandas()
+eval_df["true"] = y_true
+eval_df["pred"] = y_pred
+
+errors = eval_df[eval_df["true"] != eval_df["pred"]]
+
+print("\n=== SAMPLE MISCLASSIFICATIONS ===")
+print(errors.sample(5, random_state=42)[["text", "true", "pred"]])
+
+print("\nAll visualizations saved in folder: results/")
